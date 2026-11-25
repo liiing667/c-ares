@@ -859,6 +859,60 @@ TEST_P(CacheQueriesTest, CacheHitReportsRemainingTtl) {
   EXPECT_LT(g_qcache_hit_ttl, (unsigned int)100);
 }
 
+// Two different answers arrive for one question.  The second replaces the
+// first in the cache, so a third lookup has to return the second address.
+// The expiry index used to keep a node for the entry the hash table had
+// already replaced, so the replacement was reaped immediately and the third
+// lookup went back to the wire instead of being served from the cache.
+TEST_P(CacheQueriesTest, ReplacementAnswerServedFromCache) {
+  DNSPacket rsp1;
+  rsp1.set_response().set_aa()
+    .add_question(new DNSQuestion("www.google.com", T_A))
+    .add_answer(new DNSARR("www.google.com", 100, {1, 2, 3, 4}));
+  DNSPacket rsp2;
+  rsp2.set_response().set_aa()
+    .add_question(new DNSQuestion("www.google.com", T_A))
+    .add_answer(new DNSARR("www.google.com", 100, {5, 6, 7, 8}));
+
+  // Exactly two wire requests: one to populate the cache, one whose answer
+  // replaces that entry.  The third identical lookup must be a cache hit.
+  EXPECT_CALL(server_, OnRequest("www.google.com", T_A))
+    .WillOnce(SetReply(&server_, &rsp1))
+    .WillOnce(SetReply(&server_, &rsp2))
+    .RetiresOnSaturation();
+
+  QueryResult result1;
+  ares_query_dnsrec(channel_, "www.google.com", ARES_CLASS_IN, ARES_REC_TYPE_A,
+                    QueryCallback, &result1, nullptr);
+  Process();
+  ASSERT_TRUE(result1.done_);
+  ASSERT_EQ(ARES_SUCCESS, result1.status_);
+
+  QueryResult result2;
+  ares_query_dnsrec(channel_, "www.google.com", ARES_CLASS_IN, ARES_REC_TYPE_A,
+                    QueryCallback, &result2, nullptr);
+  Process();
+  ASSERT_TRUE(result2.done_);
+  ASSERT_EQ(ARES_SUCCESS, result2.status_);
+
+  QueryResult result3;
+  ares_query_dnsrec(channel_, "www.google.com", ARES_CLASS_IN, ARES_REC_TYPE_A,
+                    QueryCallback, &result3, nullptr);
+  Process();
+  ASSERT_TRUE(result3.done_);
+  ASSERT_EQ(ARES_SUCCESS, result3.status_);
+
+  const ares_dns_rr_t *rr = ares_dns_record_rr_get_const(
+    result3.dnsrec_.dnsrec_, ARES_SECTION_ANSWER, 0);
+  ASSERT_NE(nullptr, rr);
+  char addr[64];
+  ASSERT_NE(nullptr,
+            ares_inet_ntop(AF_INET,
+                           ares_dns_rr_get_addr(rr, ARES_RR_A_ADDR), addr,
+                           sizeof(addr)));
+  EXPECT_STREQ("5.6.7.8", addr);
+}
+
 TEST_P(CacheQueriesTest, CookieDoesNotSplitCacheEntries) {
   DNSPacket rsp;
   rsp.set_response().set_aa()

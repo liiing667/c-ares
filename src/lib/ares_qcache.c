@@ -439,6 +439,7 @@ static ares_status_t ares_qcache_insert_int(ares_qcache_t        *qcache,
                                             const ares_timeval_t *now)
 {
   ares_qcache_entry_t *entry;
+  ares_qcache_entry_t *old_entry;
   unsigned int         ttl;
   ares_dns_rcode_t     rcode = ares_dns_record_get_rcode(qresp);
   ares_dns_flags_t     flags = ares_dns_record_get_flags(qresp);
@@ -491,12 +492,35 @@ static ares_status_t ares_qcache_insert_int(ares_qcache_t        *qcache,
     goto fail; /* LCOV_EXCL_LINE: OutOfMemory */
   }
 
+  /* A fresh answer for a key that is already cached has to replace the old
+   * entry everywhere.  ares_htable_strvp_insert() replaces a matching key in
+   * place and destroys the value it held, so the old entry's expire-list node
+   * would keep pointing at freed memory: the reaper would then read a freed
+   * key, and on flush it would destroy the same entry a second time.  Take
+   * the old entry out of both indexes first -- the hash bucket, then its
+   * expire-list node -- before inserting the replacement. */
+  old_entry = ares_htable_strvp_get_direct(qcache->cache, entry->key);
+  if (old_entry != NULL) {
+    ares_slist_node_t *old_node;
+
+    /* Every cached entry is linked in both indexes, so a hash hit always
+     * has an expire-list node.  The node's destructor frees the entry and
+     * its key, which is also the hash bucket's key, so the bucket has to
+     * go first; this mirrors the ordering in ares_qcache_expire(). */
+    ares_htable_strvp_remove(qcache->cache, entry->key);
+    old_node = ares_slist_node_find(qcache->expire, old_entry);
+    ares_slist_node_destroy(old_node);
+  }
+
   if (!ares_htable_strvp_insert(qcache->cache, entry->key, entry)) {
     goto fail; /* LCOV_EXCL_LINE: OutOfMemory */
   }
 
   if (ares_slist_insert(qcache->expire, entry) == NULL) {
-    goto fail; /* LCOV_EXCL_LINE: OutOfMemory */
+    /* The hash table owns the entry now; removing its bucket runs the entry
+     * destructor, so do not also free it on the generic fail path. */
+    ares_htable_strvp_remove(qcache->cache, entry->key);
+    return ARES_ENOMEM; /* LCOV_EXCL_LINE: OutOfMemory */
   }
 
   return ARES_SUCCESS;
@@ -505,8 +529,11 @@ static ares_status_t ares_qcache_insert_int(ares_qcache_t        *qcache,
 fail:
   if (entry != NULL) {
     if (entry->key != NULL) {
-      ares_htable_strvp_remove(qcache->cache, entry->key);
       ares_free(entry->key);
+      /* No hash bucket owns the entry on this path: a failed table insert
+       * never installed one, and a failed expire-list insert removes the
+       * bucket before returning directly. */
+      ares_dns_record_destroy(entry->dnsrec);
     }
     ares_free(entry);
   }

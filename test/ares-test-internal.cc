@@ -1308,6 +1308,136 @@ TEST_F(LibraryTest, QcacheKeyDistinguishesQuestions) {
   }
 }
 
+/* Build a NOERROR response carrying a single A record with the given IPv4
+ * address and TTL.  Caller owns the record. */
+static ares_dns_record_t *qcache_make_response(const char *name,
+                                               const char *ipv4,
+                                               unsigned int ttl)
+{
+  ares_dns_record_t *dnsrec = NULL;
+  ares_dns_rr_t     *rr     = NULL;
+  struct in_addr     addr;
+
+  if (ares_dns_record_create(&dnsrec, 0, ARES_FLAG_QR, ARES_OPCODE_QUERY,
+                             ARES_RCODE_NOERROR) != ARES_SUCCESS) {
+    return NULL;
+  }
+  if (ares_dns_record_query_add(dnsrec, name, ARES_REC_TYPE_A,
+                                ARES_CLASS_IN) != ARES_SUCCESS) {
+    ares_dns_record_destroy(dnsrec);
+    return NULL;
+  }
+  if (ares_dns_record_rr_add(&rr, dnsrec, ARES_SECTION_ANSWER, name,
+                             ARES_REC_TYPE_A, ARES_CLASS_IN, ttl) !=
+      ARES_SUCCESS) {
+    ares_dns_record_destroy(dnsrec);
+    return NULL;
+  }
+  ares_inet_pton(AF_INET, ipv4, &addr);
+  if (ares_dns_rr_set_addr(rr, ARES_RR_A_ADDR, &addr) != ARES_SUCCESS) {
+    ares_dns_record_destroy(dnsrec);
+    return NULL;
+  }
+  return dnsrec;
+}
+
+/* A second answer for a key that is already cached must replace the old entry
+ * in both of the cache's indexes.  The hash table replaces matching keys in
+ * place and destroys the value they held, so without removing the old entry
+ * from the expiry skip list first, that list kept a dangling node: expiry or
+ * a flush then read freed memory and destroyed the replacement entry twice.
+ * The cached answer must also be the fresh one afterwards. */
+TEST_F(LibraryTest, QcacheReplacementStaysConsistent) {
+  ares_channel_t      *channel = NULL;
+  struct ares_options  opts;
+  ares_dns_record_t   *req     = NULL;
+  ares_dns_record_t   *resp1   = NULL;
+  ares_dns_record_t   *resp2   = NULL;
+  ares_dns_record_t   *cached  = NULL;
+  ares_query_t         query;
+  ares_timeval_t       now;
+  char                *key     = NULL;
+  const ares_dns_rr_t *rr;
+  const struct in_addr *addr;
+  char                 buf[INET_ADDRSTRLEN];
+
+  memset(&opts, 0, sizeof(opts));
+  opts.qcache_max_ttl = 3600;
+  ASSERT_EQ(ARES_SUCCESS,
+            ares_init_options(&channel, &opts, ARES_OPT_QUERY_CACHE));
+
+  ASSERT_EQ(ARES_SUCCESS,
+            ares_dns_record_create(&req, 0, ARES_FLAG_RD, ARES_OPCODE_QUERY,
+                                   ARES_RCODE_NOERROR));
+  ASSERT_EQ(ARES_SUCCESS,
+            ares_dns_record_query_add(req, "example.com", ARES_REC_TYPE_A,
+                                      ARES_CLASS_IN));
+
+  key = ares_qcache_calc_key(req);
+  ASSERT_NE((char *)NULL, key);
+
+  memset(&query, 0, sizeof(query));
+  query.qcache_key = key;
+
+  now.sec      = 1000;
+  now.usec     = 0;
+  resp1        = qcache_make_response("example.com", "1.2.3.4", 100);
+  ASSERT_NE((ares_dns_record_t *)NULL, resp1);
+  ASSERT_EQ(ARES_SUCCESS,
+            ares_qcache_insert(channel, &now, &query, resp1));
+
+  /* A newer answer for the same key replaces the first. */
+  now.sec = 2000;
+  resp2   = qcache_make_response("example.com", "5.6.7.8", 100);
+  ASSERT_NE((ares_dns_record_t *)NULL, resp2);
+  ASSERT_EQ(ARES_SUCCESS,
+            ares_qcache_insert(channel, &now, &query, resp2));
+
+  /* The hash table must hand back the replacement, not stale data. */
+  ASSERT_EQ(ARES_SUCCESS,
+            ares_qcache_fetch(channel, &now, key, &cached));
+  ASSERT_NE((ares_dns_record_t *)NULL, cached);
+  rr = ares_dns_record_rr_get_const(cached, ARES_SECTION_ANSWER, 0);
+  ASSERT_NE((ares_dns_rr_t *)NULL, rr);
+  addr = ares_dns_rr_get_addr(rr, ARES_RR_A_ADDR);
+  ASSERT_NE((const struct in_addr *)NULL, addr);
+  ASSERT_NE((char *)NULL,
+            ares_inet_ntop(AF_INET, addr, buf, sizeof(buf)));
+  EXPECT_STREQ("5.6.7.8", buf);
+  ares_dns_record_destroy(cached);
+
+  /* Expiring must not touch freed memory and must leave an empty cache behind.
+   * Before the fix the skip list still named the destroyed first entry. */
+  now.sec = 100000;
+  EXPECT_EQ(ARES_ENOTFOUND,
+            ares_qcache_fetch(channel, &now, key, &cached));
+  EXPECT_EQ((ares_dns_record_t *)NULL, cached);
+
+  /* Re-insert and exercise the flush path, which walks the same expiry list
+   * and used to destroy the replacement entry a second time on top of the
+   * dangling first node. */
+  now.sec = 2000;
+  {
+    ares_dns_record_t *resp3 =
+      qcache_make_response("example.com", "9.10.11.12", 100);
+    ASSERT_NE((ares_dns_record_t *)NULL, resp3);
+    ASSERT_EQ(ARES_SUCCESS,
+              ares_qcache_insert(channel, &now, &query, resp3));
+    /* On success the cache owns resp3; only resp1 and the first resp2 remain
+     * ours to free below. */
+  }
+  ares_qcache_flush(channel->qcache);
+  now.sec = 3000;
+  EXPECT_EQ(ARES_ENOTFOUND,
+            ares_qcache_fetch(channel, &now, key, &cached));
+
+  ares_free(key);
+  ares_dns_record_destroy(resp1);
+  ares_dns_record_destroy(resp2);
+  ares_dns_record_destroy(req);
+  ares_destroy(channel);
+}
+
 #endif /* !CARES_SYMBOL_HIDING */
 
 TEST_F(LibraryTest, InetPtoN) {
