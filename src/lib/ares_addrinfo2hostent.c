@@ -103,6 +103,8 @@ ares_status_t ares_addrinfo2hostent(const struct ares_addrinfo *ai, int family,
   size_t                     i;
   size_t                     ealiases = 0;
   size_t                     eaddrs   = 0;
+  size_t                     naliases_total;
+  size_t                     naddrs_total;
 
   if (ai == NULL || host == NULL) {
     return ARES_EBADQUERY; /* LCOV_EXCL_LINE: DefensiveCoding */
@@ -154,8 +156,12 @@ ares_status_t ares_addrinfo2hostent(const struct ares_addrinfo *ai, int family,
 
   naliases = ai_nalias(ai);
   ealiases = hostent_nalias(*host);
-  aliases  = ares_realloc_zero((*host)->h_aliases, ealiases * sizeof(char *),
-                               (naliases + ealiases + 1) * sizeof(char *));
+  if (ares_size_t_add_overflow(naliases, ealiases, &naliases_total) ||
+      ares_size_t_add_overflow(naliases_total, 1, &naliases_total)) {
+    goto enomem; /* LCOV_EXCL_LINE: OutOfMemory */
+  }
+  aliases = ares_realloc_zero_array((*host)->h_aliases, ealiases,
+                                    naliases_total, sizeof(char *));
   if (!aliases) {
     goto enomem; /* LCOV_EXCL_LINE: OutOfMemory */
   }
@@ -178,8 +184,12 @@ ares_status_t ares_addrinfo2hostent(const struct ares_addrinfo *ai, int family,
 
   naddrs = ai_naddr(ai, family);
   eaddrs = hostent_naddr(*host);
-  addrs  = ares_realloc_zero((*host)->h_addr_list, eaddrs * sizeof(char *),
-                             (naddrs + eaddrs + 1) * sizeof(char *));
+  if (ares_size_t_add_overflow(naddrs, eaddrs, &naddrs_total) ||
+      ares_size_t_add_overflow(naddrs_total, 1, &naddrs_total)) {
+    goto enomem; /* LCOV_EXCL_LINE: OutOfMemory */
+  }
+  addrs = ares_realloc_zero_array((*host)->h_addr_list, eaddrs, naddrs_total,
+                                  sizeof(char *));
   if (addrs == NULL) {
     goto enomem; /* LCOV_EXCL_LINE: OutOfMemory */
   }

@@ -1557,6 +1557,56 @@ TEST_F(FileChannelTest, GetAddrInfoHostsEmptiedInPlace)
    * name, so the lookup must fail instead of answering the stale address. */
   EXPECT_NE(ARES_SUCCESS, result2.status_);
 }
+
+TEST_F(FileChannelTest, GetAddrInfoHostsRewrittenInPlaceSameMtime)
+{
+  TempFile                   hostsfile("1.2.3.4 example.com");
+  EnvValue                   with_env("CARES_HOSTS", hostsfile.filename());
+  struct ares_addrinfo_hints hints = { 0, 0, 0, 0 };
+  hints.ai_family                  = AF_INET;
+  hints.ai_flags                   = ARES_AI_ENVHOSTS | ARES_AI_NOSORT;
+
+  /* Pin the mtime in the past so the same-second mtime heuristic is not what
+   * makes this test pass.  The rewrite below keeps the inode, size and mtime
+   * identical; only ctime can reveal it. */
+  struct timeval pinned[2];
+  gettimeofday(&pinned[0], NULL);
+  pinned[0].tv_sec -= 2;
+  pinned[1]         = pinned[0];
+  ASSERT_EQ(0, utimes(hostsfile.filename(), pinned));
+
+  AddrInfoResult result1 = {};
+  ares_getaddrinfo(channel_, "example.com", NULL, &hints, AddrInfoCallback,
+                   &result1);
+  Process();
+  EXPECT_TRUE(result1.done_);
+  {
+    std::stringstream ss;
+    ss << result1.ai_;
+    EXPECT_EQ("{addr=[1.2.3.4]}", ss.str());
+  }
+
+  {
+    FILE *fp = fopen(hostsfile.filename(), "w");
+    ASSERT_NE(nullptr, fp);
+    fprintf(fp, "9.9.9.9 example.com");
+    fclose(fp);
+    ASSERT_EQ(0, utimes(hostsfile.filename(), pinned));
+  }
+
+  /* Query repeatedly: every answer must be the new address, never the cached
+   * one, even while the same-second ctime heuristic keeps re-reading. */
+  for (int i = 0; i < 3; i++) {
+    AddrInfoResult result = {};
+    ares_getaddrinfo(channel_, "example.com", NULL, &hints, AddrInfoCallback,
+                     &result);
+    Process();
+    EXPECT_TRUE(result.done_);
+    std::stringstream ss;
+    ss << result.ai_;
+    EXPECT_EQ("{addr=[9.9.9.9]}", ss.str());
+  }
+}
 #endif
 
 TEST_F(FileChannelTest, GetAddrInfoHostsPositive) {
@@ -3091,6 +3141,66 @@ TEST_F(LibraryTest, ArrayAllocOverflowNeverReachesAllocator) {
   EXPECT_TRUE(AllocSizeFailPending(wrapped_array_size));
 }
 
+#ifndef CARES_SYMBOL_HIDING
+TEST_F(LibraryTest, SizeAddOverflow) {
+  size_t out = 123;
+
+  EXPECT_FALSE(ares_size_t_add_overflow(1, 2, &out));
+  EXPECT_EQ((size_t)3, out);
+  EXPECT_FALSE(ares_size_t_add_overflow(0, 0, &out));
+  EXPECT_EQ((size_t)0, out);
+
+  out = 123;
+  EXPECT_TRUE(ares_size_t_add_overflow(SIZE_MAX, 1, &out));
+  EXPECT_EQ((size_t)123, out);
+  EXPECT_TRUE(ares_size_t_add_overflow(1, SIZE_MAX, &out));
+  EXPECT_EQ((size_t)123, out);
+  EXPECT_TRUE(ares_size_t_add_overflow(SIZE_MAX, SIZE_MAX, &out));
+  EXPECT_EQ((size_t)123, out);
+}
+
+/* ares_strsplit_duplicate() takes the element count straight from its caller,
+ * so a count large enough to wrap the size calculation must be rejected
+ * before the allocator is asked for the short, wrapped buffer. */
+TEST_F(LibraryTest, StrSplitDuplicateOverflowNeverReachesAllocator) {
+  char *elms[1] = { NULL };
+
+  SetAllocSizeFail(wrapped_array_size);
+  EXPECT_EQ(NULL, ares_strsplit_duplicate(elms, wrapping_array_num));
+  EXPECT_TRUE(AllocSizeFailPending(wrapped_array_size));
+}
+
+/* The per-request search list is sized from channel->ndomains + 1.  A count
+ * large enough to wrap the pointer-array allocation must fail without asking
+ * the allocator for the short, wrapped buffer. */
+TEST_F(LibraryTest, SearchNameListCountOverflow) {
+  ares_channel_t *channel        = NULL;
+  char          **names          = NULL;
+  size_t          names_len      = 0;
+  char           *domains[1]     = { NULL };
+  char          **saved_domains  = NULL;
+  size_t          saved_ndomains = 0;
+  size_t          wrapped        = (wrapping_array_num + 1) * sizeof(char *);
+
+  ASSERT_EQ(ARES_SUCCESS, ares_init(&channel));
+
+  saved_domains  = channel->domains;
+  saved_ndomains = channel->ndomains;
+  channel->domains  = domains;
+  channel->ndomains = wrapping_array_num;
+
+  SetAllocSizeFail(wrapped);
+  EXPECT_NE(ARES_SUCCESS,
+            ares_search_name_list(channel, "example.com", &names, &names_len));
+  EXPECT_TRUE(AllocSizeFailPending(wrapped));
+
+  ares_strsplit_free(names, names_len);
+  channel->domains  = saved_domains;
+  channel->ndomains = saved_ndomains;
+  ares_destroy(channel);
+}
+#endif
+
 #if SIZE_MAX <= 0xFFFFFFFFUL
 /* Same check driven through the public API.  ares_options.nsort is an int
  * supplied by the application, and on a 32-bit size_t
@@ -3123,6 +3233,22 @@ TEST_F(LibraryTest, InitSortlistCountOverflow) {
   EXPECT_TRUE(AllocSizeFailPending(wrapped));
 }
 #endif
+
+TEST_F(LibraryTest, BufAppendStartOverflow) {
+  ares_buf_t *buf = ares_buf_create();
+  size_t      len = SIZE_MAX;
+
+  ASSERT_NE(nullptr, buf);
+  ASSERT_EQ(ARES_SUCCESS, ares_buf_append_str(buf, "abc"));
+
+  /* The requested length plus the reserved NUL would overflow size_t.  It
+   * must fail instead of reporting the small remainder of the allocation as
+   * writable. */
+  EXPECT_EQ(NULL, ares_buf_append_start(buf, &len));
+  EXPECT_EQ((size_t)3, ares_buf_len(buf));
+
+  ares_buf_destroy(buf);
+}
 
 TEST_F(LibraryTest, BufMisuse) {
   EXPECT_EQ(NULL, ares_buf_create_const(NULL, 0));

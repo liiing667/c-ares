@@ -57,8 +57,8 @@
  * files may be quite sizable and as per Issue #458 can approach 1/2MB in size,
  * and the parse overhead on a rapid succession of queries can be quite large.
  * The entries are stored in forwards and backwards hashtables so we can get
- * O(1) performance on lookup.  The file is cached until the file modification
- * timestamp changes.
+ * O(1) performance on lookup.  The file is cached until its identity
+ * (timestamps, size, inode, device) changes.
  *
  * The hosts file processing is quite unique. It has to merge all related hosts
  * and ips into a single entry due to file formatting requirements.  For
@@ -114,6 +114,7 @@
 typedef struct {
   ares_bool_t  valid;
   time_t       mtime;
+  time_t       ctime;
   ares_int64_t size;
   ares_int64_t ino;
   ares_int64_t dev;
@@ -725,6 +726,7 @@ static void ares_hosts_file_ident(const char              *filename,
     if (stat(filename, &st) == 0) {
       ident->valid = ARES_TRUE;
       ident->mtime = st.st_mtime;
+      ident->ctime = st.st_ctime;
       ident->size  = (ares_int64_t)st.st_size;
       ident->ino   = (ares_int64_t)st.st_ino;
       ident->dev   = (ares_int64_t)st.st_dev;
@@ -736,6 +738,7 @@ static void ares_hosts_file_ident(const char              *filename,
     if (_stat(filename, &st) == 0) {
       ident->valid = ARES_TRUE;
       ident->mtime = st.st_mtime;
+      ident->ctime = st.st_ctime;
       ident->size  = (ares_int64_t)st.st_size;
       ident->dev   = (ares_int64_t)st.st_dev;
       /* st_ino from _stat() is not meaningful on Windows; leave 0, and
@@ -889,12 +892,15 @@ static ares_bool_t ares_hosts_expired(const char              *filename,
   /* The file was replaced, possibly with an older mtime (package rollback,
    * tar -x, cp -p, backup restore) or with the same mtime but a different
    * size, inode, or device (builds that normalize file times, or a symlink
-   * retargeted to a different filesystem).  Compare the identity only when
-   * it could be read. */
+   * retargeted to a different filesystem).  ctime is included because it
+   * cannot be set by an application: it changes on an in-place rewrite even
+   * when the replacement restores the same size and mtime, and it catches
+   * filesystems that recycle inode numbers after an unlink/create cycle.
+   * Compare the identity only when it could be read. */
   if (ident.valid &&
       (!hf->ident.valid || ident.mtime != hf->ident.mtime ||
-       ident.size != hf->ident.size || ident.ino != hf->ident.ino ||
-       ident.dev != hf->ident.dev)) {
+       ident.ctime != hf->ident.ctime || ident.size != hf->ident.size ||
+       ident.ino != hf->ident.ino || ident.dev != hf->ident.dev)) {
     return ARES_TRUE;
   }
 
@@ -904,7 +910,10 @@ static ares_bool_t ares_hosts_expired(const char              *filename,
       time(NULL) - 60; /* LCOV_EXCL_LINE: only on systems without stat() */
   }
 
-  if (hf->ts <= ident.mtime) {
+  /* A file modified in the same second the cache was populated must be
+   * re-read: second-granularity mtime/ctime alone cannot tell an in-place
+   * rewrite from the file that was parsed. */
+  if (hf->ts <= ident.mtime || hf->ts <= ident.ctime) {
     return ARES_TRUE;
   }
 

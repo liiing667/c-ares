@@ -158,13 +158,13 @@ static ares_status_t ares_buf_ensure_space(ares_buf_t *buf, size_t needed_size)
     return ARES_ENOMEM;
   }
 
-  needed_size++;
-
-  if (needed_size > SIZE_MAX - buf->data_len) {
+  if (ares_size_t_add_overflow(needed_size, 1, &needed_size)) {
     return ARES_ENOMEM;
   }
 
-  total_required = buf->data_len + needed_size;
+  if (ares_size_t_add_overflow(buf->data_len, needed_size, &total_required)) {
+    return ARES_ENOMEM;
+  }
 
   /* No need to do an expensive move operation, we have enough to just append */
   remaining_size = buf->alloc_buf_len - buf->data_len;
