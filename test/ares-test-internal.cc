@@ -1308,6 +1308,101 @@ TEST_F(LibraryTest, QcacheKeyDistinguishesQuestions) {
   }
 }
 
+static ares_dns_record_t *QcacheDuplicateTestRecord(const char *address,
+                                                    unsigned int ttl)
+{
+  ares_dns_record_t *record = NULL;
+  ares_dns_rr_t     *rr     = NULL;
+  struct in_addr     addr;
+
+  if (ares_dns_record_create(&record, 0, ARES_FLAG_QR | ARES_FLAG_RD,
+                             ARES_OPCODE_QUERY, ARES_RCODE_NOERROR) !=
+      ARES_SUCCESS) {
+    return NULL;
+  }
+
+  if (ares_dns_record_query_add(record, "duplicate.example",
+                                ARES_REC_TYPE_A, ARES_CLASS_IN) !=
+      ARES_SUCCESS ||
+      ares_dns_record_rr_add(&rr, record, ARES_SECTION_ANSWER,
+                             "duplicate.example", ARES_REC_TYPE_A,
+                             ARES_CLASS_IN, ttl) != ARES_SUCCESS) {
+    ares_dns_record_destroy(record);
+    return NULL;
+  }
+
+  EXPECT_EQ(1, ares_inet_pton(AF_INET, address, &addr));
+  if (ares_dns_rr_set_addr(rr, ARES_RR_A_ADDR, &addr) != ARES_SUCCESS) {
+    ares_dns_record_destroy(record);
+    return NULL;
+  }
+
+  return record;
+}
+
+// Duplicate in-flight lookups can insert the same cache key more than once.
+// Refreshing the key must refresh its expiration node too; otherwise the old
+// sorted expiration entry later removes the replacement hash entry.
+TEST_F(LibraryTest, QcacheDuplicateInsertRefreshesExpirationEntry) {
+  struct ares_options options;
+  ares_channel_t     *channel = NULL;
+  ares_query_t        query;
+  ares_timeval_t      now;
+  ares_dns_record_t  *old_response = NULL;
+  ares_dns_record_t  *new_response = NULL;
+  ares_dns_record_t  *cached       = NULL;
+
+  memset(&options, 0, sizeof(options));
+  options.qcache_max_ttl = 3600;
+  ASSERT_EQ(ARES_SUCCESS,
+            ares_init_options(&channel, &options, ARES_OPT_QUERY_CACHE));
+
+  memset(&query, 0, sizeof(query));
+  query.qcache_key = const_cast<char *>("qcache-duplicate-key");
+  now.sec          = 1000;
+  now.usec         = 0;
+
+  old_response = QcacheDuplicateTestRecord("192.0.2.1", 100);
+  ASSERT_NE(nullptr, old_response);
+  EXPECT_EQ(ARES_SUCCESS,
+            ares_qcache_insert(channel, &now, &query, old_response));
+  ares_dns_record_destroy(old_response);
+
+  now.sec = 1001;
+  new_response = QcacheDuplicateTestRecord("192.0.2.2", 100);
+  ASSERT_NE(nullptr, new_response);
+  EXPECT_EQ(ARES_SUCCESS,
+            ares_qcache_insert(channel, &now, &query, new_response));
+  ares_dns_record_destroy(new_response);
+
+  /* The first entry's original deadline is now.  The replacement was inserted
+   * a second later, so it must remain valid for one more second. */
+  now.sec = 1100;
+  ASSERT_EQ(ARES_SUCCESS,
+            ares_qcache_fetch(channel, &now, query.qcache_key, &cached));
+  ASSERT_NE(nullptr, cached);
+  {
+    ares_dns_rr_t          *rr =
+      ares_dns_record_rr_get(cached, ARES_SECTION_ANSWER, 0);
+    const struct in_addr *addr =
+      rr == NULL ? NULL : ares_dns_rr_get_addr(rr, ARES_RR_A_ADDR);
+    char address[INET_ADDRSTRLEN] = "";
+
+    ASSERT_NE(nullptr, addr);
+    EXPECT_NE(nullptr, ares_inet_ntop(AF_INET, addr, address, sizeof(address)));
+    EXPECT_STREQ("192.0.2.2", address);
+  }
+  ares_dns_record_destroy(cached);
+  cached = NULL;
+
+  now.sec = 1101;
+  EXPECT_EQ(ARES_ENOTFOUND,
+            ares_qcache_fetch(channel, &now, query.qcache_key, &cached));
+  EXPECT_EQ(nullptr, cached);
+
+  ares_destroy(channel);
+}
+
 #endif /* !CARES_SYMBOL_HIDING */
 
 TEST_F(LibraryTest, InetPtoN) {
@@ -1556,6 +1651,53 @@ TEST_F(FileChannelTest, GetAddrInfoHostsEmptiedInPlace)
   /* The channel is files only and the emptied hosts file no longer holds the
    * name, so the lookup must fail instead of answering the stale address. */
   EXPECT_NE(ARES_SUCCESS, result2.status_);
+}
+
+TEST_F(FileChannelTest, GetAddrInfoHostsRewrittenInPlaceTracksCtime)
+{
+  TempFile                   hostsfile("1.2.3.4 example.com");
+  EnvValue                   with_env("CARES_HOSTS", hostsfile.filename());
+  struct ares_addrinfo_hints hints = { 0, 0, 0, 0 };
+  hints.ai_family                  = AF_INET;
+  hints.ai_flags                   = ARES_AI_ENVHOSTS | ARES_AI_NOSORT;
+
+  /* Pin mtime in the past.  The rewrite restores the same size and mtime;
+   * ctime and the same-second timestamp check are all that can reveal it. */
+  struct timeval pinned[2];
+  gettimeofday(&pinned[0], NULL);
+  pinned[0].tv_sec -= 2;
+  pinned[1]         = pinned[0];
+  ASSERT_EQ(0, utimes(hostsfile.filename(), pinned));
+
+  AddrInfoResult result1 = {};
+  ares_getaddrinfo(channel_, "example.com", NULL, &hints, AddrInfoCallback,
+                   &result1);
+  Process();
+  ASSERT_TRUE(result1.done_);
+  {
+    std::stringstream ss;
+    ss << result1.ai_;
+    EXPECT_EQ("{addr=[1.2.3.4]}", ss.str());
+  }
+
+  {
+    FILE *fp = fopen(hostsfile.filename(), "w");
+    ASSERT_NE(nullptr, fp);
+    fprintf(fp, "9.9.9.9 example.com");
+    fclose(fp);
+    ASSERT_EQ(0, utimes(hostsfile.filename(), pinned));
+  }
+
+  for (size_t i = 0; i < 3; i++) {
+    AddrInfoResult result = {};
+    ares_getaddrinfo(channel_, "example.com", NULL, &hints,
+                     AddrInfoCallback, &result);
+    Process();
+    EXPECT_TRUE(result.done_);
+    std::stringstream ss;
+    ss << result.ai_;
+    EXPECT_EQ("{addr=[9.9.9.9]}", ss.str());
+  }
 }
 #endif
 

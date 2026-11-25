@@ -36,6 +36,10 @@ typedef struct {
   ares_dns_record_t *dnsrec;
   time_t             expire_ts;
   time_t             insert_ts;
+  /*! Link in the expiration list.  Keeping this allows a reinsert for the
+   *  same key to retire the previous expiration entry instead of leaving a
+   *  second sorted node that can evict the replacement at the old deadline. */
+  ares_slist_node_t *expire_node;
 } ares_qcache_entry_t;
 
 char *ares_qcache_calc_key(const ares_dns_record_t *dnsrec)
@@ -348,6 +352,8 @@ ares_status_t ares_qcache_create(ares_rand_state *rand_state,
     goto done;            /* LCOV_EXCL_LINE: OutOfMemory */
   }
 
+  /* The expiration slist owns entries; the hash table only points at them, so
+   * it must not install a value destructor here. */
   cache->cache = ares_htable_strvp_create(NULL);
   if (cache->cache == NULL) {
     status = ARES_ENOMEM; /* LCOV_EXCL_LINE: OutOfMemory */
@@ -438,7 +444,9 @@ static ares_status_t ares_qcache_insert_int(ares_qcache_t        *qcache,
                                             const char           *key,
                                             const ares_timeval_t *now)
 {
-  ares_qcache_entry_t *entry;
+  ares_qcache_entry_t *entry     = NULL;
+  ares_qcache_entry_t *old_entry = NULL;
+  ares_slist_node_t   *expire_node;
   unsigned int         ttl;
   ares_dns_rcode_t     rcode = ares_dns_record_get_rcode(qresp);
   ares_dns_flags_t     flags = ares_dns_record_get_flags(qresp);
@@ -473,6 +481,13 @@ static ares_status_t ares_qcache_insert_int(ares_qcache_t        *qcache,
     return ARES_EREFUSED;
   }
 
+  /* The hash table points at the newest entry, but entries are owned by the
+   * expiration list.  Remember the previous entry so its expiration node can
+   * be removed when this key is refreshed (notably duplicate in-flight
+   * queries).  Otherwise the old node remains in the sorted list and, when it
+   * reaches its deadline, removes the new key's hash entry. */
+  old_entry = ares_htable_strvp_get_direct(qcache->cache, key);
+
   entry = ares_malloc_zero(sizeof(*entry));
   if (entry == NULL) {
     goto fail; /* LCOV_EXCL_LINE: OutOfMemory */
@@ -495,9 +510,15 @@ static ares_status_t ares_qcache_insert_int(ares_qcache_t        *qcache,
     goto fail; /* LCOV_EXCL_LINE: OutOfMemory */
   }
 
-  if (ares_slist_insert(qcache->expire, entry) == NULL) {
+  if (old_entry != NULL) {
+    ares_slist_node_destroy(old_entry->expire_node);
+  }
+
+  expire_node = ares_slist_insert(qcache->expire, entry);
+  if (expire_node == NULL) {
     goto fail; /* LCOV_EXCL_LINE: OutOfMemory */
   }
+  entry->expire_node = expire_node;
 
   return ARES_SUCCESS;
 

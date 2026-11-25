@@ -114,6 +114,7 @@
 typedef struct {
   ares_bool_t  valid;
   time_t       mtime;
+  time_t       ctime;
   ares_int64_t size;
   ares_int64_t ino;
   ares_int64_t dev;
@@ -725,6 +726,7 @@ static void ares_hosts_file_ident(const char              *filename,
     if (stat(filename, &st) == 0) {
       ident->valid = ARES_TRUE;
       ident->mtime = st.st_mtime;
+      ident->ctime = st.st_ctime;
       ident->size  = (ares_int64_t)st.st_size;
       ident->ino   = (ares_int64_t)st.st_ino;
       ident->dev   = (ares_int64_t)st.st_dev;
@@ -736,6 +738,7 @@ static void ares_hosts_file_ident(const char              *filename,
     if (_stat(filename, &st) == 0) {
       ident->valid = ARES_TRUE;
       ident->mtime = st.st_mtime;
+      ident->ctime = st.st_ctime;
       ident->size  = (ares_int64_t)st.st_size;
       ident->dev   = (ares_int64_t)st.st_dev;
       /* st_ino from _stat() is not meaningful on Windows; leave 0, and
@@ -889,10 +892,13 @@ static ares_bool_t ares_hosts_expired(const char              *filename,
   /* The file was replaced, possibly with an older mtime (package rollback,
    * tar -x, cp -p, backup restore) or with the same mtime but a different
    * size, inode, or device (builds that normalize file times, or a symlink
-   * retargeted to a different filesystem).  Compare the identity only when
-   * it could be read. */
+   * retargeted to a different filesystem).  ctime is also compared because
+   * an in-place rewrite can restore mtime, size and (on inode recycling)
+   * inode while ctime still changes.  Compare the identity only when it could
+   * be read. */
   if (ident.valid &&
       (!hf->ident.valid || ident.mtime != hf->ident.mtime ||
+       ident.ctime != hf->ident.ctime ||
        ident.size != hf->ident.size || ident.ino != hf->ident.ino ||
        ident.dev != hf->ident.dev)) {
     return ARES_TRUE;
@@ -904,7 +910,11 @@ static ares_bool_t ares_hosts_expired(const char              *filename,
       time(NULL) - 60; /* LCOV_EXCL_LINE: only on systems without stat() */
   }
 
-  if (hf->ts <= ident.mtime) {
+  /* A rewrite in the same second as the cached parse can leave second-granular
+   * mtime and ctime looking equal to the stored values.  The <= comparison
+   * forces another read in that case; once the cache timestamp is newer than
+   * both file times, the identity checks provide the fast path. */
+  if (hf->ts <= ident.mtime || hf->ts <= ident.ctime) {
     return ARES_TRUE;
   }
 
